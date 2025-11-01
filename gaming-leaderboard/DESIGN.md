@@ -7,25 +7,25 @@
 - Keep the system evolvable so that sharding or additional Redis replicas can be introduced later with minimal refactor.
 
 ## 2. High-Level Architecture
-- **Clients** (web/mobile) interact through HTTPS + WebSocket connections exposed by the API Gateway.
+- **Clients** (web/mobile) interact through HTTPS + Server-Sent Events (SSE) connections exposed by the API Gateway.
 - **API Service** handles REST requests for score submissions, leaderboard fetches, and user rank queries; it enforces authentication using OAuth 2.0 bearer tokens.
 - **Score Command Service** receives validated score submissions from the API Service, persists the score change to PostgreSQL, and emits a message to Kafka for downstream processing.
 - **Kafka** acts as the backbone for asynchronous score processing. The primary topic (`score-events`) carries score updates to downstream consumers. A secondary compacted topic (`leaderboard-notifications`) drives throttled leaderboard pushes to subscribers.
 - **Score Projection Worker** (Kafka consumer) processes score events, updates Redis sorted sets, refreshes cached top-10 payloads, and publishes notification triggers when the top-10 meaningfully changes.
 - **Redis (single instance)** stores leaderboard data (`ZSET`) and cached payloads for top-10 responses.
 - **PostgreSQL** remains the system of record for users and their historical scores.
-- **WebSocket Broadcaster** subscribes to leaderboard notifications and pushes updates to connected clients at the throttled cadence.
+- **SSE Broadcaster** subscribes to leaderboard notifications and streams updates to connected clients at the throttled cadence.
 
 ```mermaid
 flowchart LR
-    Clients((Clients)) -->|HTTPS/WS| API[API Service]
+    Clients((Clients)) -->|HTTPS| API[API Service]
     API -->|Persist score| PG[(PostgreSQL)]
     API -->|Publish events| Kafka[(Kafka)]
     Kafka --> Worker[Score Projection Worker]
     Worker -->|ZADD/ZRANGE| Redis[(Redis)]
     Worker -->|Notify| Notifier[Leaderboard Notifier]
-    Notifier --> WS[WebSocket Broadcaster]
-    WS -->|Broadcast| Clients
+    Notifier --> SSE[SSE Broadcaster]
+    SSE -->|SSE stream| Clients
     API -->|Read leaderboards| Redis
 ```
 
@@ -42,8 +42,9 @@ flowchart LR
   - Consumes Kafka events, updates Redis sorted sets using `ZADD` and `ZREVRANK`.
   - Maintains a cached JSON blob for the global top 10 (`GET/SET current_top_10`) with a short TTL (e.g., 1s) to reduce Redis load for high read volumes.
   - Emits lightweight messages to `leaderboard-notifications` when a top-10 entry changes score or membership after throttling.
-- **WebSocket Broadcaster**
-  - Listens to notification topic, queries Redis for the latest top 10, and pushes updates to subscribed clients with rate limits (e.g., max 1 update per 500ms per leaderboard channel).
+- **SSE Broadcaster**
+  - Listens to notification topic, queries Redis for the latest top 10, and streams updates over long-lived HTTP responses with rate limits (e.g., max 1 update per 500ms per leaderboard channel).
+  - Uses SSE reconnection semantics (`Last-Event-ID`) so clients can resume streams after transient disconnects without missing updates.
 - **Operational Console / Admin UI** (optional)
   - Permits support staff to reprocess events, inspect Redis state, and replay Kafka partitions.
 
@@ -145,7 +146,7 @@ sequenceDiagram
     participant K as Kafka
     participant W as Score Projection Worker
     participant R as Redis
-    participant WS as WebSocket Broadcaster
+    participant SSE as SSE Broadcaster
 
     C->>API: POST /scores
     API->>PG: Write new score + version
@@ -156,9 +157,9 @@ sequenceDiagram
     K-->>W: Deliver event
     W->>R: ZADD / rank lookup / cache top 10
     W->>K: Emit leaderboard notification
-    K-->>WS: Deliver notification
-    WS->>R: Fetch cached top 10
-    WS-->>C: Push update (WebSocket)
+    K-->>SSE: Deliver notification
+    SSE->>R: Fetch cached top 10
+    SSE-->>C: Push update (SSE)
 ```
 
 1. Client sends `POST /scores` with `{ "score": 4500 }` and authorization token.
@@ -175,7 +176,7 @@ sequenceDiagram
    - Read cached `leaderboard:top10`; if stale or missing, recompute via `ZRANGE leaderboard:global 0 9 REV WITHSCORES` and `SET` the JSON payload with TTL.
    - Detect top-10 change by comparing against previous snapshot (persist last snapshot hash in Redis key `leaderboard:last_digest`).
    - When changed, publish notification message to `leaderboard-notifications` (subject to throttle rules described in §8).
-8. WebSocket Broadcaster receives notification, loads `leaderboard:top10`, and broadcasts to clients subscribed to the global leaderboard channel.
+8. SSE Broadcaster receives notification, loads `leaderboard:top10`, and streams to clients subscribed to the global leaderboard channel.
 
 ### 6.2 Get Top 10 Flow
 
@@ -256,7 +257,7 @@ flowchart TD
 ## 8. Throttling & Rate Control
 - Projection Worker maintains a Redis key (`leaderboard:last_emit_ts`) storing the timestamp of the last notification.
 - Only publish a new notification if at least 500ms elapsed or if the top-10 membership changed.
-- WebSocket layer enforces per-connection rate limiting (e.g., 20 updates/minute) to protect clients.
+- SSE layer enforces per-connection rate limiting (e.g., 20 updates/minute) to protect clients.
 - REST `GET /leaderboard/top` can be served entirely from `leaderboard:top10` cache. If cache miss occurs, recompute on-demand and set TTL.
 
 ## 9. API Contract (Draft)
@@ -284,7 +285,7 @@ Response: {
 ## 10. Operational Considerations
 - **Redis Availability**: Single instance with AOF + RDB + automated backups. Deploy using managed service or run Redis with systemd + sentinel in monitor-only mode for alerting. Expect failover window in disaster scenario; document manual promotion plan.
 - **Monitoring**:
-  - Metrics: Redis memory usage, command latency, Kafka consumer lag, API latency, WebSocket broadcast counts.
+  - Metrics: Redis memory usage, command latency, Kafka consumer lag, API latency, SSE broadcast counts.
   - Logs: Structured JSON logs with request IDs; Kafka consumer logs include offsets and errors.
   - Alerts: High consumer lag, Redis memory > 70%, API error rate > 1%, nightly RDB failure.
 - **Scaling**:
@@ -310,7 +311,7 @@ Response: {
   - If event duplication occurs, idempotency via `version` prevents double-apply in Redis.
 - **PostgreSQL outage**:
   - API rejects write operations with clear error. Reads still served from Redis but marked as eventually consistent.
-- **WebSocket broadcaster failure**:
+- **SSE broadcaster failure**:
   - Clients fallback to polling `GET /leaderboard/top` until broadcaster recovers.
 
 ## 12. Testing & Observability
@@ -322,5 +323,5 @@ Response: {
 ## 13. Roadmap Considerations
 - Introduce Redis Cluster when DAU approaches 50M or memory pressure > 60%.
 - Add regional caches/CDN for read-heavy deployments.
-- Extract WebSocket broadcaster into dedicated service with horizontal scaling and sharded channels.
+- Extract SSE broadcaster into dedicated service with horizontal scaling and sharded channels.
 - Explore CQRS: separate read API service that only interacts with Redis for further scale.

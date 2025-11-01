@@ -95,7 +95,7 @@ sequenceDiagram
     participant API as API Service
     participant PG as PostgreSQL
     participant R as Redis
-    participant WS as WebSocket Broadcaster
+    participant SSE as SSE Broadcaster
 
     C->>API: POST /scores
     API->>PG: Write new score
@@ -106,8 +106,8 @@ sequenceDiagram
     API->>API: Compare new top 10 with current top 10
     alt Top 10 changed
       API->>R: SET new top 10
-      API->>WS: Deliver notification
-      WS-->>C: Push update (WebSocket)
+      API->>SSE: Deliver notification
+      SSE-->>C: Stream update (SSE)
     end
     API->>R: ZREVRANK
     R->>API: New rank of user
@@ -122,6 +122,8 @@ GET current_top_10
 ZRANGE leaderboard 0 9 REV WITHSCORES
 SET current_top_10 "[(user1,score1),(user2,score2),...]"
 ```
+
+The SSE broadcaster maintains a long-lived HTTP response per subscriber so leaderboard changes propagate without requiring bidirectional WebSocket infrastructure.
 
 #### 2. A user fetchs the top 10 global leaderboard
 ```mermaid
@@ -195,6 +197,6 @@ In the event the Redis cluster experiences a large-scale failure, we have a clea
 
 Further improvement:
 ------
-- Decouple Front-end Services: Separate the web server (handling static content and API calls) from the WebSocket server (handling real-time updates) and implement service discovery to manage communication between them.
+- Decouple Front-end Services: Separate the web server (handling static content and API calls) from the SSE broadcaster (handling real-time updates) and implement service discovery to manage communication between them.
 - Adopt Microservices: Transition to a microservice architecture by breaking the system into multiple smaller, independent services. This will allow for independent development, deployment, and granular scaling of each function.
 - Adopt CQRS: Split the write (command) and read (query) responsibilities into distinct services to simplify scaling and enable specialized optimizations for each workload.
